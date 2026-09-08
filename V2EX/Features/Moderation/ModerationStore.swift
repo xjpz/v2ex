@@ -201,6 +201,13 @@ final class ModerationStore: ObservableObject {
         return false
     }
 
+    func isHidden(notification: V2Notification) -> Bool {
+        if isBlocked(username: notification.authorName) { return true }
+        if let id = notification.member?.id ?? notification.memberId,
+           unavailableBlockedIDs.contains(id) { return true }
+        return false
+    }
+
     func filter(_ topics: [V2Topic]) -> [V2Topic] {
         guard count > 0 else { return topics }
         return topics.filter { !isHidden($0) }
@@ -210,7 +217,15 @@ final class ModerationStore: ObservableObject {
     /// 的楼层集体前移 —— #5 被隐藏后 #6 仍然叫 #6，引用关系才对得上。
     func visible(_ items: [ThreadedReply]) -> [ThreadedReply] {
         guard count > 0 else { return items }
-        return items.filter { !isHidden(reply: $0.reply) }
+        let hiddenFloors = Set(items.filter { isHidden(reply: $0.reply) }.map(\.floor))
+        return items.filter { !isHidden(reply: $0.reply) }.map { item in
+            var item = item
+            if let quote = item.quoted,
+               isBlocked(username: quote.username) || quote.floor.map({ hiddenFloors.contains($0) }) == true {
+                item.quoted = nil
+            }
+            return item
+        }
     }
 
     // MARK: 屏蔽

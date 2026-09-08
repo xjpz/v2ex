@@ -36,3 +36,11 @@ python3 tests/check-topic-pages.py
 ```
 
 Checks cover append/deduplication, retrying the same page after failure, refresh, cached cursors, stale responses after switching feeds, exhausted followed nodes, public recent/node HTML templates, and end-of-list detection. The parser check optionally accepts paths to public page-2 HTML captures (include `node` in node capture filenames); captures stay outside the repository.
+
+## Website notification read state
+
+```sh
+python3 tests/check-notification-sync.py
+```
+
+Uses the production counter parser, request sequence and view model with an isolated transport. Verifies account checks before marking, homepage-only refresh, website counter import, acknowledgement followed by verification, failure preservation, missing sessions, and stale results after logout. No real notification is changed by this test. V2EX exposes an account-wide unread counter; the app does not invent individual read flags or persist local seen IDs.

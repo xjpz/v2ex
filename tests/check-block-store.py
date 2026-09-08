@@ -30,7 +30,13 @@ import Combine
 struct Member { let id: Int? }
 struct V2Topic { let id: Int; let authorName: String; let title: String; let content: String?; var member: Member? = nil }
 struct V2Reply { let id: Int; let authorName: String; let content: String; var member: Member? = nil }
-struct ThreadedReply { let reply: V2Reply }
+struct ThreadedReply {
+    let reply: V2Reply
+    var floor: Int = 0
+    var quoted: Quote? = nil
+    struct Quote { let username: String; let floor: Int?; let excerpt: String }
+}
+struct V2Notification { let authorName: String; var member: Member? = nil; var memberId: Int? = nil }
 @MainActor final class V2EXSessionStore {
     var username = "alice"
     var cookie = "alice-cookie"
@@ -114,6 +120,20 @@ struct ThreadedReply { let reply: V2Reply }
         let hidden = V2Topic(id: 1, authorName: "unknown", title: "x", content: nil, member: Member(id: 999))
         precondition(reopened.isHidden(hidden))
         print("PASS unavailable official user retained, counted and filtered by ID")
+        precondition(reopened.isHidden(notification: V2Notification(authorName: "visibleuser")))
+        precondition(reopened.isHidden(notification: V2Notification(authorName: "", memberId: 999)))
+        precondition(!reopened.isHidden(notification: V2Notification(authorName: "Allowed")))
+        let blocked = ThreadedReply(reply: V2Reply(id: 1, authorName: "VisibleUser", content: "hidden"), floor: 5)
+        let normal = ThreadedReply(reply: V2Reply(id: 2, authorName: "Allowed", content: "normal"), floor: 6,
+            quoted: .init(username: "VisibleUser", floor: 5, excerpt: "hidden"))
+        let orphan = ThreadedReply(reply: V2Reply(id: 3, authorName: "Deleted", content: "hidden", member: Member(id: 999)), floor: 7)
+        let orphanQuote = ThreadedReply(reply: V2Reply(id: 4, authorName: "Allowed", content: "normal"), floor: 8,
+            quoted: .init(username: "Deleted", floor: 7, excerpt: "hidden"))
+        let filtered = reopened.visible([blocked, normal, orphan, orphanQuote])
+        precondition(filtered.map(\.floor) == [6, 8] && filtered.allSatisfy { $0.quoted == nil })
+        precondition(reopened.visible([normal]).first?.quoted == nil)
+        print("PASS blocked notifications, replies and quote previews hidden; original floors preserved")
+
         client.mutationFail = true
         reopened.block(username: "FailedUser", session: session)
         precondition(!reopened.isBlocked(username: "FailedUser"))

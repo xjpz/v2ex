@@ -363,6 +363,29 @@ actor V2EXClient {
         try await getV2("/api/v2/notifications", query: ["p": String(page)], token: token)
     }
 
+    func notificationReadState(cookie: String, account: String) async throws -> WebsiteNotificationState {
+        guard !cookie.isEmpty else { throw V2EXError.sessionExpired }
+        let html = try await memberBlockHTML(path: "/", cookie: cookie, userAgent: Self.desktopUserAgent)
+        guard let state = WebsiteNotificationState(html: html) else {
+            throw V2EXError.decoding("无法读取官网未读提醒，请重新登录后重试")
+        }
+        guard state.username.lowercased() == account.lowercased() else {
+            throw V2EXError.decoding("网页登录账号与通知 Token 的账号不一致")
+        }
+        return state
+    }
+
+    func markNotificationsRead(cookie: String, account: String) async throws -> WebsiteNotificationState {
+        // Verify the cookie account before visiting the page that clears its unread counter.
+        _ = try await notificationReadState(cookie: cookie, account: account)
+        let html = try await memberBlockHTML(path: "/notifications", cookie: cookie, userAgent: Self.desktopUserAgent)
+        guard html.contains("/notifications?p="), WebsiteNotificationState(html: html)?.username.lowercased() == account.lowercased() else {
+            throw V2EXError.decoding("官网未确认提醒页面，请重试")
+        }
+        // Never update the local badge merely because the request returned HTTP 200.
+        return try await notificationReadState(cookie: cookie, account: account)
+    }
+
     func deleteNotification(id: Int, token: String) async throws {
         var request = try makeRequest(path: "/api/v2/notifications/\(id)", query: [:])
         request.httpMethod = "DELETE"
@@ -1448,3 +1471,24 @@ final class ModerationReplayProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 #endif
+
+/// The website exposes an account-wide counter, not per-notification read flags.
+struct WebsiteNotificationState {
+    let username: String
+    let unreadCount: Int
+
+    init?(html: String) {
+        func capture(_ pattern: String) -> String? {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+                  let range = Range(match.range(at: 1), in: html) else { return nil }
+            return String(html[range])
+        }
+        guard html.contains("/signout?"),
+              let username = capture(#"<a(?=[^>]*href="/member/([A-Za-z0-9_]+)")(?=[^>]*class="top")[^>]*>"#),
+              let count = capture(#"<a\b[^>]*href="/notifications"[^>]*>\s*([0-9,]+)\s*(?:未读提醒|unread[^<]*)\s*</a>"#),
+              let unreadCount = Int(count.replacingOccurrences(of: ",", with: "")) else { return nil }
+        self.username = username
+        self.unreadCount = unreadCount
+    }
+}

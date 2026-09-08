@@ -154,8 +154,8 @@ struct RootView: View {
             guard !isLaunching else { return }
             await updateChecker.checkForUpdate()
         }
-        .task(id: token.token) {
-            await notifications.refresh(token: token.token)
+        .task(id: token.token + ":" + session.cookie) {
+            await notifications.refresh(token: token.token, session: session)
         }
         .task(id: session.cookie + ":" + session.username) {
             await moderation.refreshWebsiteBlocks(session: session)
@@ -172,6 +172,7 @@ struct RootView: View {
             guard phase == .active else { return }
             Task { await syncAutomaticOffline() }
             Task { await moderation.flush() }
+            Task { await notifications.refresh(token: token.token, session: session) }
             Task { await moderation.refreshWebsiteBlocks(session: session) }
         }
         .onOpenURL(perform: handleDeepLink)

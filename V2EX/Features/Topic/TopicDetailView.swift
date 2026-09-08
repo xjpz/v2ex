@@ -276,19 +276,24 @@ struct TopicDetailView: View {
         return String(fragment)
     }
 
-    /// Everyone in this thread, nearest floor first — the person you are
-    /// answering is almost always one of the last few to have spoken.
+    /// Resolve hidden quote targets against all floors before applying the author-only filter.
+    private var filteredReplies: [ThreadedReply] {
+        let selectedIDs = Set(model.visibleReplies.map(\.id))
+        return moderation.visible(model.replies).filter { selectedIDs.contains($0.id) }
+    }
+
+    /// Visible participants, nearest floor first.
     private var mentionCandidates: [String] {
         guard let query = activeMentionQuery else { return [] }
 
         var seen: Set<String> = []
         var ordered: [String] = []
-        for item in model.replies.reversed() where !item.reply.authorName.isEmpty {
+        for item in moderation.visible(model.replies).reversed() where !item.reply.authorName.isEmpty {
             if seen.insert(item.reply.authorName).inserted {
                 ordered.append(item.reply.authorName)
             }
         }
-        if let author = model.topic?.authorName, !author.isEmpty, seen.insert(author).inserted {
+        if let author = model.topic?.authorName, !author.isEmpty, !moderation.isBlocked(username: author), seen.insert(author).inserted {
             ordered.append(author)
         }
         if !session.username.isEmpty { ordered.removeAll { $0 == session.username } }
@@ -592,7 +597,7 @@ struct TopicDetailView: View {
 
     @ViewBuilder
     private func discussionTrack(_ proxy: ScrollViewProxy) -> some View {
-        let visible = moderation.visible(model.visibleReplies)
+        let visible = filteredReplies
         if visible.count > 1 {
             DiscussionTrack(
                 items: sampledTrackItems(from: visible),
@@ -637,7 +642,7 @@ struct TopicDetailView: View {
 
     @ViewBuilder
     private func replyList(_ proxy: ScrollViewProxy) -> some View {
-        let items = moderation.visible(model.visibleReplies)
+        let items = filteredReplies
         if items.isEmpty {
             if model.isLoading {
                 LoadingCard()

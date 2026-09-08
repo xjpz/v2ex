@@ -7,39 +7,86 @@ final class NotificationsViewModel: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published var scope: V2Notification.Kind? = .reply
 
-    /// IDs already seen, so the badge and the tinted rows agree.
-    @Published private(set) var seenIDs: Set<Int> = Set(
-        UserDefaults.standard.array(forKey: "seenNotifications") as? [Int] ?? []
-    )
+    @Published private(set) var officialUnreadCount: Int?
+    @Published private(set) var syncMessage: String?
+    @Published private(set) var isSyncing = false
+    private var generation = UUID()
+    private var identity = ""
+    private var account: String?
 
-    var unreadCount: Int { items.filter { !seenIDs.contains($0.id) }.count }
+    var unreadCount: Int { officialUnreadCount ?? 0 }
 
     func visible(in scope: V2Notification.Kind?) -> [V2Notification] {
         guard let scope else { return items }
         return items.filter { $0.kind == scope }
     }
 
-    func count(of kind: V2Notification.Kind) -> Int {
-        items.filter { $0.kind == kind && !seenIDs.contains($0.id) }.count
-    }
-
-    func isUnread(_ item: V2Notification) -> Bool { !seenIDs.contains(item.id) }
-
-    func refresh(token: String) async {
-        guard !token.isEmpty else {
+    func refresh(token: String, session: V2EXSessionStore) async {
+        let key = token + ":" + session.cookie
+        if key == identity && isSyncing { return }
+        if key != identity {
+            identity = key
             items = []
-            errorMessage = nil
+            officialUnreadCount = nil
+            account = nil
+        }
+        let request = UUID()
+        generation = request
+        let cookie = session.cookie
+        guard !token.isEmpty else {
+            isLoading = false
+            syncMessage = nil
             return
         }
         isLoading = true
         errorMessage = nil
-        defer { isLoading = false }
-
+        defer { if generation == request { isLoading = false } }
         do {
-            items = try await V2EXClient.shared.notifications(page: 1, token: token)
+            let member = try await V2EXClient.shared.currentMember(token: token)
+            let result = try await V2EXClient.shared.notifications(page: 1, token: token)
+            guard generation == request else { return }
+            account = member.username
+            items = result
+            if cookie.isEmpty {
+                officialUnreadCount = nil
+                syncMessage = "登录同一账号的网页会话后，可同步官网未读数量和全部已读状态。"
+            } else {
+                do {
+                    let state = try await V2EXClient.shared.notificationReadState(cookie: cookie, account: member.username)
+                    guard generation == request else { return }
+                    officialUnreadCount = state.unreadCount
+                    syncMessage = nil
+                } catch {
+                    guard generation == request else { return }
+                    officialUnreadCount = nil
+                    syncMessage = error.localizedDescription
+                }
+            }
             await backfillAvatars()
         } catch {
-            errorMessage = (error as? V2EXError)?.errorDescription ?? error.localizedDescription
+            guard generation == request else { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func markAllRead(session: V2EXSessionStore) async {
+        guard !isSyncing, !isLoading, let account else { return }
+        let request = generation
+        let cookie = session.cookie
+        guard !cookie.isEmpty else {
+            syncMessage = "请先登录网页账号，再同步全部已读。"
+            return
+        }
+        isSyncing = true
+        defer { isSyncing = false }
+        do {
+            let state = try await V2EXClient.shared.markNotificationsRead(cookie: cookie, account: account)
+            guard generation == request else { return }
+            officialUnreadCount = state.unreadCount
+            syncMessage = state.unreadCount == 0 ? "已同步官网：全部已读" : "官网仍有新提醒，请刷新后重试。"
+        } catch {
+            guard generation == request else { return }
+            syncMessage = "已读同步失败：" + error.localizedDescription
         }
     }
 
@@ -48,6 +95,7 @@ final class NotificationsViewModel: ObservableObject {
     private var avatarCache: [String: String] = [:]
 
     private func backfillAvatars() async {
+        let request = generation
         // Re-apply cached avatars to the fresh rows first — every refresh
         // replaces `items` with a payload that never carries avatar fields,
         // so without this the avatars get wiped on each refresh.
@@ -65,6 +113,7 @@ final class NotificationsViewModel: ObservableObject {
                   avatarCache[member.username] == nil else { continue }
             guard let fetched = try? await V2EXClient.shared.member(username: member.username),
                   let url = fetched.avatarURL?.absoluteString else { continue }
+            guard generation == request else { return }
             avatarCache[member.username] = url
             for index in items.indices where items[index].member?.username == member.username {
                 items[index].member?.avatarLarge = url
@@ -72,30 +121,26 @@ final class NotificationsViewModel: ObservableObject {
         }
     }
 
-    func markAllRead() {
-        seenIDs.formUnion(items.map(\.id))
-        persistSeen()
-    }
-
-    func markRead(_ item: V2Notification) {
-        guard seenIDs.insert(item.id).inserted else { return }
-        persistSeen()
-    }
-
     func delete(_ item: V2Notification, token: String) async {
         guard !token.isEmpty else { return }
-        try? await V2EXClient.shared.deleteNotification(id: item.id, token: token)
-        items.removeAll { $0.id == item.id }
+        let request = generation
+        do {
+            try await V2EXClient.shared.deleteNotification(id: item.id, token: token)
+            guard generation == request else { return }
+            items.removeAll { $0.id == item.id }
+        } catch {
+            guard generation == request else { return }
+            syncMessage = "删除失败：" + error.localizedDescription
+        }
     }
 
-    private func persistSeen() {
-        UserDefaults.standard.set(Array(seenIDs), forKey: "seenNotifications")
-    }
 }
 
 struct NotificationsView: View {
     @EnvironmentObject private var model: NotificationsViewModel
     @EnvironmentObject private var token: TokenStore
+    @EnvironmentObject private var session: V2EXSessionStore
+    @EnvironmentObject private var moderation: ModerationStore
 
     /// Per-scope scroll offsets, so swiping between scopes doesn't lose your place.
     @State private var scrollPositions: [V2Notification.Kind?: ScrollPosition] = [:]
@@ -122,13 +167,13 @@ struct NotificationsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("全部已读") {
-                    withAnimation(.snappy) { model.markAllRead() }
+                    Task { await model.markAllRead(session: session) }
                 }
-                .disabled(model.unreadCount == 0)
+                .disabled(model.isSyncing || model.isLoading || !session.isLoggedIn || model.officialUnreadCount == nil || model.unreadCount == 0)
             }
         }
         .topSafeAreaBar(spacing: 0) { scopePicker }
-        .task { await model.refresh(token: token.token) }
+        .task { await model.refresh(token: token.token, session: session) }
     }
 
     private var scopePicker: some View {
@@ -145,14 +190,25 @@ struct NotificationsView: View {
     }
 
     private func scopeLabel(_ kind: V2Notification.Kind?, title: String) -> String {
-        let count = kind.map { model.count(of: $0) } ?? model.unreadCount
-        return count > 0 ? "\(title) \(count)" : title
+        title
     }
 
     private func page(for kind: V2Notification.Kind?) -> some View {
-        let visible = model.visible(in: kind)
+        let visible = model.visible(in: kind).filter { !moderation.isHidden(notification: $0) }
         return ScrollView {
             LazyVStack(spacing: 10) {
+                if token.hasToken {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let count = model.officialUnreadCount { Text("官网未读提醒：\(count)") }
+                        Text("官网按全部提醒统一标记已读，请使用右上角「全部已读」。")
+                        if let message = model.syncMessage { Text(message) }
+                        if !session.isLoggedIn {
+                            NavigationLink("登录网页账号", value: Route.v2exLogin)
+                        }
+                        if model.isSyncing { ProgressView("正在同步官网") }
+                    }
+                    .font(.footnote).foregroundStyle(Theme.muted).padding(.horizontal)
+                }
                 if !token.hasToken {
                     tokenPrompt
                 } else if model.isLoading && model.items.isEmpty {
@@ -160,7 +216,7 @@ struct NotificationsView: View {
                 } else if let message = model.errorMessage, model.items.isEmpty {
                     EmptyStateCard(icon: "exclamationmark.triangle", title: "没能读取通知", message: message,
                                    actionTitle: "重试") {
-                        Task { await model.refresh(token: token.token) }
+                        Task { await model.refresh(token: token.token, session: session) }
                     }
                 } else if visible.isEmpty {
                     EmptyStateCard(icon: "bell.slash", title: "没有新通知")
@@ -181,7 +237,7 @@ struct NotificationsView: View {
         }
         .scrollIndicators(.hidden)
         .pullToRefresh(isEnabled: model.scope == kind) {
-            await model.refresh(token: token.token)
+            await model.refresh(token: token.token, session: session)
         }
         .scrollPosition(scrollBinding(for: kind))
     }
@@ -212,19 +268,17 @@ struct NotificationsView: View {
 
     private func row(_ item: V2Notification) -> some View {
         let parsed = item.parsed
-        let unread = model.isUnread(item)
 
         return Group {
             if let topicID = parsed.topicID {
-                NavigationLink(value: Route.topic(topicID)) { rowContent(item, parsed: parsed, unread: unread) }
+                NavigationLink(value: Route.topic(topicID)) { rowContent(item, parsed: parsed) }
                     .buttonStyle(.row)
-                    .simultaneousGesture(TapGesture().onEnded { model.markRead(item) })
+
             } else {
-                rowContent(item, parsed: parsed, unread: unread)
+                rowContent(item, parsed: parsed)
             }
         }
         .contextMenu {
-            Button("标记已读") { model.markRead(item) }
             Button(role: .destructive) {
                 Task { await model.delete(item, token: token.token) }
             } label: {
@@ -235,8 +289,7 @@ struct NotificationsView: View {
 
     private func rowContent(
         _ item: V2Notification,
-        parsed: (action: String, topicTitle: String?, topicID: Int?),
-        unread: Bool
+        parsed: (action: String, topicTitle: String?, topicID: Int?)
     ) -> some View {
         HStack(alignment: .top, spacing: 11) {
             IdentitySquare(text: item.authorName, size: 34, imageURL: item.member?.avatarURL)
@@ -273,16 +326,6 @@ struct NotificationsView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
-        .background(unread ? Theme.accentWash : Color.clear)
-        .overlay(alignment: .topLeading) {
-            if unread {
-                Circle()
-                    .fill(Theme.accent)
-                    .frame(width: 7, height: 7)
-                    .padding(.leading, 6)
-                    .padding(.top, 18)
-            }
-        }
         .contentShape(Rectangle())
     }
 }
