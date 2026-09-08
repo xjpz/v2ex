@@ -197,18 +197,6 @@ struct NotificationsView: View {
         let visible = model.visible(in: kind).filter { !moderation.isHidden(notification: $0) }
         return ScrollView {
             LazyVStack(spacing: 10) {
-                if token.hasToken {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let count = model.officialUnreadCount { Text("官网未读提醒：\(count)") }
-                        Text("官网按全部提醒统一标记已读，请使用右上角「全部已读」。")
-                        if let message = model.syncMessage { Text(message) }
-                        if !session.isLoggedIn {
-                            NavigationLink("登录网页账号", value: Route.v2exLogin)
-                        }
-                        if model.isSyncing { ProgressView("正在同步官网") }
-                    }
-                    .font(.footnote).foregroundStyle(Theme.muted).padding(.horizontal)
-                }
                 if !token.hasToken {
                     tokenPrompt
                 } else if model.isLoading && model.items.isEmpty {
