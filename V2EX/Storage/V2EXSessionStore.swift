@@ -19,6 +19,13 @@ final class V2EXSessionStore: ObservableObject {
     var isLoggedIn: Bool { !cookie.isEmpty }
 
     init() {
+        #if DEBUG && targetEnvironment(simulator)
+        if let scenario = ModerationReplay.scenario {
+            cookie = "moderation-response-replay"
+            username = scenario.account
+            return
+        }
+        #endif
         cookie = read(service: cookieService) ?? ""
         username = read(service: usernameService) ?? ""
     }

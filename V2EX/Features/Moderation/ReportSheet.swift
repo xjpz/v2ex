@@ -8,6 +8,7 @@ struct ReportSheet: View {
     let target: ModerationTarget
 
     @EnvironmentObject private var moderation: ModerationStore
+    @EnvironmentObject private var session: V2EXSessionStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var reason: ReportReason?
@@ -84,11 +85,12 @@ struct ReportSheet: View {
                                     Text("同时屏蔽 @\(target.author)")
                                         .font(Type.body(16))
                                         .foregroundStyle(Theme.ink)
-                                    Text("此人的所有话题和回复都不再出现")
+                                    Text(session.isLoggedIn ? "官网确认后，屏蔽此人的话题和回复" : "需要先网页登录")
                                         .font(Type.meta(12))
                                         .foregroundStyle(Theme.muted)
                                 }
                             }
+                            .disabled(!session.isLoggedIn)
                             .tint(Theme.accent)
                             .padding(.horizontal, Theme.Metric.cardPadding)
                             .frame(minHeight: Theme.Metric.rowHeight)
@@ -118,7 +120,7 @@ struct ReportSheet: View {
         guard let reason else { return }
         moderation.report(target, reason: reason, note: note.trimmingCharacters(in: .whitespacesAndNewlines))
         if alsoBlock, !target.author.isEmpty {
-            moderation.block(target)
+            moderation.block(target, session: session)
         }
         dismiss()
     }
@@ -135,6 +137,7 @@ struct ModerationMenuItems: View {
     let onReport: (ModerationTarget) -> Void
 
     @EnvironmentObject private var moderation: ModerationStore
+    @EnvironmentObject private var session: V2EXSessionStore
 
     var body: some View {
         Button {
@@ -145,7 +148,7 @@ struct ModerationMenuItems: View {
 
         if !target.author.isEmpty, !moderation.isBlocked(username: target.author) {
             Button(role: .destructive) {
-                moderation.block(target)
+                moderation.block(target, session: session)
             } label: {
                 Label("屏蔽 @\(target.author)", systemImage: "nosign")
             }

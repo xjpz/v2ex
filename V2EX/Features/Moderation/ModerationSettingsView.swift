@@ -4,22 +4,36 @@ import SwiftUI
 /// 摆在同一页 —— 用户按下举报之后，唯一能反悔的地方就是这里。
 struct ModerationSettingsView: View {
     @EnvironmentObject private var moderation: ModerationStore
+    @EnvironmentObject private var session: V2EXSessionStore
     @Environment(\.openURL) private var openURL
 
-    @State private var newKeyword = ""
     @State private var newUsername = ""
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 moderationSummary
+                HStack {
+                    Text(moderation.websiteListMessage ?? "官网名单尚未读取")
+                        .font(Type.meta(12))
+                        .foregroundStyle(Theme.muted)
+                    Spacer()
+                    if moderation.isRefreshingWebsite {
+                        ProgressView()
+                    } else {
+                        Button("刷新") {
+                            Task { await moderation.refreshWebsiteBlocks(session: session) }
+                        }
+                        .font(Type.meta(12))
+                    }
+                }
+                .padding(.horizontal, Theme.Metric.headerPadding)
 
-                keywordSection
                 usernameSection
                 hiddenSection
                 reportSection
 
-                Text("屏蔽和举报的记录只存在本机，不会随账号同步。")
+                Text("屏蔽统一使用 V2EX 官网名单，需网页登录。操作经官网确认后生效，可下拉刷新名单。")
                     .font(Type.meta(12))
                     .lineSpacing(3)
                     .foregroundStyle(Theme.faint)
@@ -34,6 +48,8 @@ struct ModerationSettingsView: View {
         .navigationTitle("内容与屏蔽")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
+        .task { await moderation.refreshWebsiteBlocks(session: session) }
+        .refreshable { await moderation.refreshWebsiteBlocks(session: session) }
     }
 
     // MARK: 概览
@@ -52,7 +68,7 @@ struct ModerationSettingsView: View {
                         Text("你的内容边界")
                             .font(.system(size: 18, weight: .bold))
                             .foregroundStyle(Theme.ink)
-                        Text("规则只在这台设备生效，随时可以撤销。")
+                        Text("屏蔽名单与当前 V2EX 账号保持一致。")
                             .font(Type.meta(12))
                             .foregroundStyle(Theme.muted)
                     }
@@ -60,8 +76,7 @@ struct ModerationSettingsView: View {
                 .accessibilityElement(children: .combine)
 
                 HStack(spacing: 0) {
-                    summaryMetric(moderation.keywords.count, label: "关键词")
-                    summaryMetric(moderation.usernames.count, label: "用户")
+                    summaryMetric(moderation.blockedUserCount, label: "官网屏蔽")
                     summaryMetric(moderation.hiddenTopicIDs.count + moderation.hiddenReplyIDs.count, label: "已隐藏")
                     summaryMetric(moderation.pendingReportCount, label: "待送达")
                 }
@@ -88,26 +103,75 @@ struct ModerationSettingsView: View {
 
     // MARK: 屏蔽名单
 
-    private var keywordSection: some View {
-        listSection(
-            header: "屏蔽的关键词",
-            placeholder: "添加要屏蔽的关键词",
-            text: $newKeyword,
-            items: moderation.keywords,
-            onAdd: { moderation.addKeyword($0) },
-            onRemove: { moderation.removeKeyword($0) }
-        )
+    private var usernameSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            GroupHeader(title: "官网屏蔽的用户")
+            if !session.isLoggedIn {
+                CardSection(padding: 16) {
+                    NavigationLink(value: Route.v2exLogin) {
+                        Label("网页登录后管理屏蔽名单", systemImage: "person.crop.circle")
+                            .font(Type.body(15))
+                            .foregroundStyle(Theme.accent)
+                    }
+                }
+            } else {
+                CardSection {
+                    HStack(spacing: 8) {
+                        TextField("输入要屏蔽的用户名", text: $newUsername)
+                            .font(Type.body(15))
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .onSubmit { addUser() }
+                        Button("屏蔽") { addUser() }
+                            .disabled(newUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !moderation.syncingUsers.isEmpty)
+                    }
+                    .padding(16)
+                    if !moderation.syncingUsers.isEmpty {
+                        HStack {
+                            ProgressView()
+                            Text("正在等待官网确认…").font(Type.meta(12))
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
+                    }
+                    ForEach(moderation.usernames, id: \.self) { username in
+                        RowSeparator()
+                        HStack {
+                            Text(username).font(Type.body(16))
+                            Spacer()
+                            Button("取消屏蔽") {
+                                moderation.unblock(username: username, session: session)
+                            }
+                            .font(Type.meta(13))
+                            .foregroundStyle(Theme.accent)
+                            .disabled(moderation.syncingUsers.contains(username.lowercased()))
+                        }
+                        .padding(16)
+                    }
+                    ForEach(moderation.unavailableBlockedIDs, id: \.self) { id in
+                        RowSeparator()
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("用户 #\(String(id))").font(Type.body(16))
+                            Text("官网用户资料不可用，屏蔽记录仍保留")
+                                .font(Type.meta(12))
+                                .foregroundStyle(Theme.muted)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                    }
+                    if moderation.blockedUserCount == 0, !moderation.isRefreshingWebsite {
+                        Text("当前没有已读取的官网屏蔽用户")
+                            .font(Type.meta(13))
+                            .foregroundStyle(Theme.muted)
+                            .padding(16)
+                    }
+                }
+            }
+        }
     }
 
-    private var usernameSection: some View {
-        listSection(
-            header: "屏蔽的用户",
-            placeholder: "添加要屏蔽的用户名",
-            text: $newUsername,
-            items: moderation.usernames,
-            onAdd: { moderation.block(username: $0) },
-            onRemove: { moderation.unblock(username: $0) }
-        )
+    private func addUser() {
+        moderation.block(username: newUsername, session: session)
     }
 
     // MARK: 被举报隐藏的内容
@@ -198,7 +262,7 @@ struct ModerationSettingsView: View {
                     Text(report.summary)
                         .font(Type.body(15))
                         .foregroundStyle(Theme.ink)
-                    Text("\(report.kind == .block ? "已屏蔽" : report.reason.title) · \(RelativeTime.string(from: report.createdAt))")
+                    Text("\(report.kind == .block ? "屏蔽记录" : report.reason.title) · \(RelativeTime.string(from: report.createdAt))")
                         .font(Type.meta(12))
                         .foregroundStyle(Theme.muted)
                 }
@@ -221,68 +285,4 @@ struct ModerationSettingsView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: 复用的名单编辑区
-
-    private func listSection(
-        header: String,
-        placeholder: String,
-        text: Binding<String>,
-        items: [String],
-        onAdd: @escaping (String) -> Void,
-        onRemove: @escaping (String) -> Void
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            GroupHeader(title: header)
-            CardSection {
-                HStack(spacing: 8) {
-                    TextField(placeholder, text: text)
-                        .font(.system(size: 15))
-                        .accessibilityLabel(placeholder)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .padding(.horizontal, 12)
-                        .frame(height: 42)
-                        .background(Theme.inset, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                        .onSubmit {
-                            onAdd(text.wrappedValue)
-                            text.wrappedValue = ""
-                        }
-                    Button {
-                        onAdd(text.wrappedValue)
-                        text.wrappedValue = ""
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 42, height: 42)
-                            .background(Theme.accent, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(text.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
-                    .accessibilityLabel("添加")
-                }
-                .padding(12)
-
-                ForEach(items, id: \.self) { item in
-                    RowSeparator()
-                    HStack {
-                        Text(item)
-                            .font(.system(size: 16))
-                            .foregroundStyle(Theme.ink)
-                        Spacer()
-                        Button {
-                            withAnimation(.snappy) { onRemove(item) }
-                        } label: {
-                            Image(systemName: "minus.circle.fill")
-                                .font(.system(size: 18))
-                                .foregroundStyle(Theme.unreadDot)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-            }
-        }
-    }
 }

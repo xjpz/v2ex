@@ -157,6 +157,9 @@ struct RootView: View {
         .task(id: token.token) {
             await notifications.refresh(token: token.token)
         }
+        .task(id: session.cookie + ":" + session.username) {
+            await moderation.refreshWebsiteBlocks(session: session)
+        }
         // 登录后把网页收藏的节点同步到本地（自动同步开关控制）。
         .task(id: session.isLoggedIn) {
             guard settings.autoSyncFollowedNodes else { return }
@@ -169,6 +172,7 @@ struct RootView: View {
             guard phase == .active else { return }
             Task { await syncAutomaticOffline() }
             Task { await moderation.flush() }
+            Task { await moderation.refreshWebsiteBlocks(session: session) }
         }
         .onOpenURL(perform: handleDeepLink)
         .onContinueUserActivity(CSSearchableItemActionType) { activity in

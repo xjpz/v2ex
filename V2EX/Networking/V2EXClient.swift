@@ -10,6 +10,7 @@ enum V2EXError: LocalizedError {
     case sessionExpired
     case replyFailed(String)
     case postFailed(String)
+    case blockFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +26,7 @@ enum V2EXError: LocalizedError {
         case .sessionExpired: return "网页会话已过期，请重新登录"
         case .replyFailed(let detail): return "回复失败：\(detail)"
         case .postFailed(let detail): return detail
+        case .blockFailed(let detail): return detail
         }
     }
 }
@@ -81,6 +83,9 @@ actor V2EXClient {
             "User-Agent": "V2EX-SwiftUI/1.0 (iOS)",
             "Accept": "application/json",
         ]
+        #if DEBUG && targetEnvironment(simulator)
+        if ModerationReplay.scenario != nil { configuration.protocolClasses = [ModerationReplayProtocol.self] }
+        #endif
         session = URLSession(configuration: configuration)
         self.responseCache = responseCache
 
@@ -90,6 +95,9 @@ actor V2EXClient {
         webConfiguration.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
         ]
+        #if DEBUG && targetEnvironment(simulator)
+        if ModerationReplay.scenario != nil { webConfiguration.protocolClasses = [ModerationReplayProtocol.self] }
+        #endif
         webSession = URLSession(configuration: webConfiguration)
 
         decoder = JSONDecoder()
@@ -890,6 +898,75 @@ extension V2EXClient {
 
     // MARK: - Favorites (web session)
 
+    /// 使用主页实际提供的操作链接，不自行拼接用户 ID 或复用过期 once。
+    /// 重试时先读状态，因此已经成功的操作不会被反向 toggle。
+    func setMemberBlocked(username: String, blocked: Bool, cookie: String) async throws {
+        guard !cookie.isEmpty else { throw V2EXError.sessionExpired }
+        guard username.range(of: #"^[A-Za-z0-9_]+$"#, options: .regularExpression) != nil else {
+            throw V2EXError.blockFailed("用户名格式不正确")
+        }
+        let path = "/member/\(username)"
+        let before = try await memberBlockPage(path: path, cookie: cookie)
+        guard before.blocked != blocked else { return }
+
+        _ = try await memberBlockHTML(path: before.actionPath, cookie: cookie, referer: path)
+        let after = try await memberBlockPage(path: path, cookie: cookie)
+        guard after.memberID == before.memberID, after.blocked == blocked else {
+            throw V2EXError.blockFailed("官网尚未确认\(blocked ? "屏蔽" : "取消屏蔽")，请重试")
+        }
+    }
+
+    private func memberBlockPage(path: String, cookie: String) async throws -> MemberBlockPage {
+        let html = try await memberBlockHTML(path: path, cookie: cookie)
+        guard let page = MemberBlockPage(html: html) else {
+            throw V2EXError.blockFailed("未找到官网屏蔽按钮，请确认登录仍有效、用户存在且不是你自己")
+        }
+        return page
+    }
+
+    private func memberBlockHTML(path: String, cookie: String, referer: String? = nil,
+                                 userAgent: String = V2EXClient.mobileUserAgent) async throws -> String {
+        var request = URLRequest(url: V2EXEndpoint.url(path), cachePolicy: .reloadIgnoringLocalCacheData)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        // 不让 URLSession 中残留的 Cookie 覆盖本次操作所选账号。
+        request.httpShouldHandleCookies = false
+        if let referer { request.setValue(V2EXEndpoint.base + referer, forHTTPHeaderField: "Referer") }
+        let (data, response) = try await webSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw V2EXError.decoding("网页响应无效") }
+        if http.url?.path == "/signin" || http.url?.path == "/2fa" || http.statusCode == 401 {
+            throw V2EXError.sessionExpired
+        }
+        guard http.statusCode == 200 else { throw V2EXError.badStatus(http.statusCode) }
+        guard let html = String(data: data, encoding: .utf8) else { throw V2EXError.decoding("网页编码无效") }
+        return html
+    }
+
+    /// 官网桌面首页包含当前账号的完整 blocked ID 数组，设置页只有人数。
+    func blockedUsers(cookie: String) async throws -> WebsiteBlockSnapshot {
+        guard !cookie.isEmpty else { throw V2EXError.sessionExpired }
+        let html = try await memberBlockHTML(path: "/", cookie: cookie, userAgent: Self.desktopUserAgent)
+        guard let ids = WebsiteBlockList.ids(from: html) else {
+            throw V2EXError.blockFailed("无法读取官网屏蔽名单，请确认网页登录有效后重试")
+        }
+        var names: [String] = []
+        var unavailableIDs: [Int] = []
+        for id in ids {
+            try Task.checkCancellation()
+            do {
+                let member: V2Member = try await getV1("/api/members/show.json", query: ["id": String(id)])
+                guard member.id == id, !member.username.isEmpty else {
+                    throw V2EXError.blockFailed("官网屏蔽用户信息不完整，请稍后重试")
+                }
+                names.append(member.username)
+            } catch V2EXError.badStatus(404) {
+                // 官网名单可能保留资料已不可访问的用户，不能让单条 404 拖垮整张名单。
+                unavailableIDs.append(id)
+            }
+        }
+        return WebsiteBlockSnapshot(usernames: names, unavailableIDs: unavailableIDs)
+    }
+
     /// 主题页收藏区：是否已收藏 + 页面 once。
     /// V2EX 收藏是 toggle：未收藏时按钮为「加入收藏」，已收藏时按钮为「取消收藏」。
     struct FavoritePageInfo {
@@ -1236,3 +1313,106 @@ extension V2EXClient {
         return String(html[Range(match.range(at: 1), in: html)!])
     }
 }
+
+/// 只接受官网 Block/Unblock 按钮中完整的站内操作地址。
+/// 不从帖子文字、任意 URL 子串或缺失按钮的页面推断屏蔽状态。
+struct MemberBlockPage {
+    let blocked: Bool
+    let memberID: String
+    let actionPath: String
+
+    init?(html: String) {
+        guard let tags = try? NSRegularExpression(pattern: #"<input\b(?:[^>"']|"[^"]*"|'[^']*')*>"#, options: .caseInsensitive),
+              let attributes = try? NSRegularExpression(pattern: #"\b([a-zA-Z]+)\s*=\s*(?:"([^"]*)"|'([^']*)')"#),
+              let action = try? NSRegularExpression(pattern: #"(?:^|[;\s{])(?:window\.)?location\.href\s*=\s*['"](/(block|unblock)/(\d+)\?once=\d+)['"]"#)
+        else { return nil }
+        var candidates: [(String, String, String)] = []
+        for tagMatch in tags.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            let tag = (html as NSString).substring(with: tagMatch.range)
+            var fields: [String: String] = [:]
+            for match in attributes.matches(in: tag, range: NSRange(tag.startIndex..., in: tag)) {
+                let name = (tag as NSString).substring(with: match.range(at: 1)).lowercased()
+                let range = match.range(at: 2).location != NSNotFound ? match.range(at: 2) : match.range(at: 3)
+                fields[name] = (tag as NSString).substring(with: range)
+            }
+            guard let label = fields["value"]?.lowercased(), ["block", "unblock"].contains(label),
+                  let script = fields["onclick"],
+                  let match = action.firstMatch(in: script, range: NSRange(script.startIndex..., in: script))
+            else { continue }
+            let text = script as NSString
+            let kind = text.substring(with: match.range(at: 2))
+            guard kind == label else { continue }
+            candidates.append((kind, text.substring(with: match.range(at: 3)), text.substring(with: match.range(at: 1))))
+        }
+        guard candidates.count == 1, let candidate = candidates.first else { return nil }
+        blocked = candidate.0 == "unblock"
+        memberID = candidate.1
+        actionPath = candidate.2
+    }
+}
+
+/// 缺失数组是登录失效或模板变化；只有明确的 [] 才表示空名单。
+enum WebsiteBlockList {
+    static func ids(from html: String) -> [Int]? {
+        guard let scripts = try? NSRegularExpression(pattern: #"<script\b[^>]*>([\s\S]*?)</script>"#, options: .caseInsensitive),
+              let pattern = try? NSRegularExpression(pattern: #"(?:^|[;\r\n])\s*(?:const|let|var)\s+blocked\s*=\s*(\[\s*(?:\d+(?:\s*,\s*\d+)*)?\s*\])\s*;"#)
+        else { return nil }
+        var lists: [[Int]] = []
+        for script in scripts.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            let body = (html as NSString).substring(with: script.range(at: 1))
+            for match in pattern.matches(in: body, range: NSRange(body.startIndex..., in: body)) {
+                let json = (body as NSString).substring(with: match.range(at: 1))
+                guard let ids = try? JSONDecoder().decode([Int].self, from: Data(json.utf8)),
+                      ids.allSatisfy({ $0 > 0 }) else { return nil }
+                lists.append(ids)
+            }
+        }
+        guard lists.count == 1 else { return nil }
+        return Array(Set(lists[0])).sorted()
+    }
+}
+
+struct WebsiteBlockSnapshot: Codable {
+    var usernames: [String]
+    var unavailableIDs: [Int]
+}
+
+#if DEBUG && targetEnvironment(simulator)
+/// 仅模拟器 Debug 可用的真实 HTTP 响应回放。不会导入 Cookie、写 Keychain 或提交官网操作。
+/// 使用 -moderationReplay /absolute/path/scenario.json 直接打开屏蔽页。
+enum ModerationReplay {
+    struct Response: Decodable {
+        let path: String
+        let status: Int
+        let body: String
+    }
+    struct Scenario: Decodable {
+        let account: String
+        let responses: [Response]
+    }
+    static let scenario: Scenario? = {
+        let args = ProcessInfo.processInfo.arguments
+        guard let index = args.firstIndex(of: "-moderationReplay"), index + 1 < args.count,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: args[index + 1])) else { return nil }
+        return try? JSONDecoder().decode(Scenario.self, from: data)
+    }()
+}
+
+final class ModerationReplayProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let url = request.url else { return }
+        var path = url.path
+        if let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "id" })?.value {
+            path += "?id=\(id)"
+        }
+        let response = ModerationReplay.scenario?.responses.first { $0.path == path }
+        let status = response?.status ?? 503
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data((response?.body ?? "No captured response").utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+#endif

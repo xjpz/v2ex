@@ -173,7 +173,6 @@ struct SearchView: View {
         model.hits.filter { hit in
             !moderation.hiddenTopicIDs.contains(hit.id)
                 && !moderation.isBlocked(username: hit.member)
-                && !moderation.matchesKeyword(hit.title + " " + hit.content)
         }
     }
 

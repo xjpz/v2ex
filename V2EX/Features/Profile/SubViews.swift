@@ -911,6 +911,7 @@ struct MemberView: View {
     @State private var isLoading = false
     @State private var reportTarget: ModerationTarget?
     @EnvironmentObject private var moderation: ModerationStore
+    @EnvironmentObject private var session: V2EXSessionStore
 
     var body: some View {
         ScrollView {
@@ -963,7 +964,7 @@ struct MemberView: View {
                     )
                     if moderation.isBlocked(username: username) {
                         Button {
-                            moderation.unblock(username: username)
+                            moderation.unblock(username: username, session: session)
                         } label: {
                             Label("取消屏蔽", systemImage: "arrow.uturn.backward")
                         }
@@ -991,7 +992,7 @@ struct MemberView: View {
                     Text("他的话题和回复不会出现在 App 的任何地方。")
                         .font(Type.body(13))
                         .foregroundStyle(Theme.muted)
-                    Button("取消屏蔽") { moderation.unblock(username: username) }
+                    Button("取消屏蔽") { moderation.unblock(username: username, session: session) }
                         .font(Type.meta(13))
                         .foregroundStyle(Theme.accent)
                         .buttonStyle(.plain)

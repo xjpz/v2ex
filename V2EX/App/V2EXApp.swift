@@ -22,7 +22,7 @@ struct V2EXApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView(isLaunching: $showLaunchAnimation)
+            mainView
                 .environmentObject(settings)
                 .environmentObject(token)
                 .environmentObject(session)
@@ -41,6 +41,14 @@ struct V2EXApp: App {
                 .environmentObject(history)
                 .preferredColorScheme(settings.theme.colorScheme)
                 .tint(Theme.accent)
+                .alert("官网屏蔽同步", isPresented: Binding(
+                    get: { moderation.websiteNotice != nil },
+                    set: { if !$0 { moderation.websiteNotice = nil } }
+                )) {
+                    Button("知道了", role: .cancel) { moderation.websiteNotice = nil }
+                } message: {
+                    Text(moderation.websiteNotice ?? "")
+                }
                 .overlay {
                     if showLaunchAnimation {
                         LaunchAnimationView {
@@ -53,6 +61,19 @@ struct V2EXApp: App {
                     await SpotlightIndexer.shared.replace(with: spotlightTopics)
                 }
         }
+    }
+
+    @ViewBuilder
+    private var mainView: some View {
+        #if DEBUG && targetEnvironment(simulator)
+        if ModerationReplay.scenario != nil {
+            NavigationStack { ModerationSettingsView() }
+        } else {
+            RootView(isLaunching: $showLaunchAnimation)
+        }
+        #else
+        RootView(isLaunching: $showLaunchAnimation)
+        #endif
     }
 
     private var spotlightTopics: [V2Topic] {
