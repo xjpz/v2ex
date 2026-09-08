@@ -27,3 +27,12 @@ The scenario format is:
 ```
 
 Keep personal captures outside the repository and omit credentials. The homepage fixture can retain only the `blocked` script needed by the parser. Response replay verifies UI and parsing; it is not a live authenticated website test.
+
+## Feed pagination
+
+```sh
+python3 tests/check-feed-pagination.py
+python3 tests/check-topic-pages.py
+```
+
+Checks cover append/deduplication, retrying the same page after failure, refresh, cached cursors, stale responses after switching feeds, exhausted followed nodes, public recent/node HTML templates, and end-of-list detection. The parser check optionally accepts paths to public page-2 HTML captures (include `node` in node capture filenames); captures stay outside the repository.

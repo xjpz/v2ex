@@ -22,15 +22,17 @@ final class NodeDetailViewModel: ObservableObject {
     @Published var sort: Sort = .lastReply
 
     private var raw: [V2Topic] = []
-    private var page = 1
-    private var reachedEnd = false
+    @Published private(set) var page = 1
+    @Published private(set) var reachedEnd = false
+    @Published private(set) var moreError: String?
 
     var sorted: [V2Topic] {
         switch sort {
         case .lastReply:
             return raw.sorted { ($0.lastTouched ?? 0) > ($1.lastTouched ?? 0) }
         case .newest:
-            return raw.sorted { ($0.created ?? 0) > ($1.created ?? 0) }
+            // Website rows omit creation timestamps; topic IDs retain creation order.
+            return raw.sorted { $0.id > $1.id }
         case .weeklyHot:
             let cutoff = Date().timeIntervalSince1970 - 7 * 86_400
             let recent = raw.filter { TimeInterval($0.lastTouched ?? 0) > cutoff }
@@ -40,22 +42,26 @@ final class NodeDetailViewModel: ObservableObject {
     }
 
     func load(name: String, token: String) async {
+        guard !isLoading else { return }
         isLoading = true
         errorMessage = nil
+        moreError = nil
         defer { isLoading = false }
 
         node = (try? await V2EXClient.shared.node(name: name))
             ?? V2Node.stub(name: name, title: NodeCatalog.displayName(for: name))
 
         do {
-            // API 2.0 paginates; v1 gives only the first page but needs no token.
+            // Both token API and public website support pagination.
             if !token.isEmpty {
                 raw = try await V2EXClient.shared.nodeTopicsPaged(name: name, page: 1, token: token)
                 page = 1
                 reachedEnd = raw.isEmpty
             } else {
-                raw = try await V2EXClient.shared.topics(inNode: name)
-                reachedEnd = true
+                let result = try await V2EXClient.shared.publicTopicPage(node: name, page: 1)
+                raw = result.topics
+                page = 1
+                reachedEnd = !result.hasMore
             }
             topics = raw
         } catch {
@@ -63,24 +69,31 @@ final class NodeDetailViewModel: ObservableObject {
         }
     }
 
-    func loadMoreIfNeeded(currentItem: V2Topic, name: String, token: String) async {
-        guard !token.isEmpty, !reachedEnd, !isLoading,
-              currentItem.id == sorted.last?.id else { return }
-
+    func loadMore(name: String, token: String) async {
+        guard !reachedEnd, !isLoading else { return }
         isLoading = true
+        moreError = nil
         defer { isLoading = false }
-
-        let next = page + 1
-        guard let more = try? await V2EXClient.shared.nodeTopicsPaged(name: name, page: next, token: token),
-              !more.isEmpty else {
-            reachedEnd = true
-            return
+        do {
+            let next = page + 1
+            let more: [V2Topic]
+            if token.isEmpty {
+                let result = try await V2EXClient.shared.publicTopicPage(node: name, page: next)
+                more = result.topics
+                reachedEnd = !result.hasMore
+            } else {
+                more = try await V2EXClient.shared.nodeTopicsPaged(name: name, page: next, token: token)
+                reachedEnd = more.isEmpty
+            }
+            page = next
+            var seen = Set(raw.map(\.id))
+            raw.append(contentsOf: more.filter { seen.insert($0.id).inserted })
+            topics = raw
+        } catch {
+            moreError = error.localizedDescription
         }
-        page = next
-        var seen = Set(raw.map(\.id))
-        raw.append(contentsOf: more.filter { seen.insert($0.id).inserted })
-        topics = raw
     }
+
 }
 
 struct NodeDetailView: View {
@@ -103,6 +116,16 @@ struct NodeDetailView: View {
                 headerCard
                 sortChips
                 topicList
+                if let error = model.moreError {
+                    Text(error).font(.footnote).foregroundStyle(Theme.muted)
+                    Button("重试加载更多") { Task { await model.loadMore(name: nodeName, token: token.token) } }
+                } else if !model.topics.isEmpty && !model.reachedEnd {
+                    ProgressView().frame(maxWidth: .infinity).padding()
+                        .task(id: model.page) { await model.loadMore(name: nodeName, token: token.token) }
+                } else if !model.topics.isEmpty {
+                    Text("没有更多话题了").font(.footnote).foregroundStyle(Theme.muted)
+                        .frame(maxWidth: .infinity).padding()
+                }
             }
             .readableColumn()
             .padding(.bottom, 12)
@@ -240,11 +263,6 @@ struct NodeDetailView: View {
                     )
                 }
                 .buttonStyle(.row)
-                .task {
-                    await model.loadMoreIfNeeded(
-                        currentItem: topic, name: nodeName, token: token.token
-                    )
-                }
             }
         }
     }

@@ -27,52 +27,104 @@ final class HomeViewModel: ObservableObject {
     @Published private(set) var topics: [V2Topic] = []
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var moreError: String?
+    @Published private(set) var hasMore = false
+    @Published private(set) var paginationID = UUID()
 
-    private var cache: [Feed: [V2Topic]] = [:]
+    private struct Snapshot {
+        var topics: [V2Topic]
+        var page: Int
+        var sources: [String]
+        var hasMore: Bool
+    }
+    private var cache: [Feed: Snapshot] = [:]
+    private var generation = UUID()
+    private var followedNames: [String] = []
 
-    /// 关注 merges the newest topics of every followed node into one stream.
     func load(feed: Feed, followedNodes: [String], force: Bool = false) async {
         self.feed = feed
-
-        if !force, let cached = cache[feed], !cached.isEmpty {
-            topics = cached
+        let request = UUID()
+        generation = request
+        if followedNames != followedNodes { cache[.following] = nil }
+        followedNames = followedNodes
+        moreError = nil
+        errorMessage = nil
+        if !force, let cached = cache[feed] {
+            topics = cached.topics
+            hasMore = cached.hasMore
+            isLoading = false
             return
         }
-
-        // Never show the previous category's rows under a newly selected chip
-        // while its request is in flight. A brief, honest loading state is less
-        // disorienting than content that changes identity a moment later.
         if !force { topics = [] }
         isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
-
+        defer { if generation == request { isLoading = false } }
         do {
-            let result: [V2Topic]
-            switch feed {
-            case .all:
-                result = try await V2EXClient.shared.latestTopics()
-            case .hot:
-                result = try await V2EXClient.shared.hotTopics()
-            case .r2:
-                result = try await V2EXClient.shared.r2Topics()
-            case .node(let name, _):
-                result = try await V2EXClient.shared.topics(inNode: name)
-            case .following:
-                result = try await followingFeed(nodes: followedNodes)
-            case .hackerNews:
-                // HN 页自己取数，不经过这里的 V2EX 管道。
-                return
-            }
-            cache[feed] = result
-            // A newer selection may have landed while this request was in flight —
-            // don't let a stale response clobber the page the user is looking at.
-            guard self.feed == feed else { return }
-            topics = result
+            let snapshot = try await fetch(feed: feed, page: 1, sources: followedNodes)
+            guard generation == request, self.feed == feed else { return }
+            cache[feed] = snapshot
+            topics = snapshot.topics
+            hasMore = snapshot.hasMore
+            paginationID = UUID()
         } catch {
-            guard self.feed == feed else { return }
-            errorMessage = (error as? V2EXError)?.errorDescription ?? error.localizedDescription
-            topics = cache[feed] ?? []
+            guard generation == request, self.feed == feed else { return }
+            errorMessage = error.localizedDescription
+            topics = cache[feed]?.topics ?? []
+            hasMore = cache[feed]?.hasMore ?? false
+        }
+    }
+
+    func loadMore(feed: Feed) async {
+        guard self.feed == feed, !isLoading, hasMore, let previous = cache[feed] else { return }
+        let request = generation
+        isLoading = true
+        moreError = nil
+        defer { if generation == request { isLoading = false } }
+        do {
+            var next = try await fetch(feed: feed, page: previous.page + 1, sources: previous.sources)
+            guard generation == request, self.feed == feed else { return }
+            var seen = Set(previous.topics.map(\.id))
+            next.topics = previous.topics + next.topics.filter { seen.insert($0.id).inserted }
+            cache[feed] = next
+            topics = next.topics
+            hasMore = next.hasMore
+            paginationID = UUID()
+        } catch {
+            guard generation == request, self.feed == feed else { return }
+            moreError = error.localizedDescription
+        }
+    }
+
+    private func fetch(feed: Feed, page: Int, sources: [String]) async throws -> Snapshot {
+        switch feed {
+        case .hot:
+            return Snapshot(topics: try await V2EXClient.shared.hotTopics(), page: 1, sources: [], hasMore: false)
+        case .r2:
+            return Snapshot(topics: try await V2EXClient.shared.r2Topics(), page: 1, sources: [], hasMore: false)
+        case .hackerNews:
+            return Snapshot(topics: [], page: 1, sources: [], hasMore: false)
+        case .all, .node, .following:
+            let nodes: [String]
+            switch feed {
+            case .node(let name, _): nodes = [name]
+            case .following: nodes = sources
+            default: nodes = []
+            }
+            if nodes.isEmpty {
+                let result = try await V2EXClient.shared.publicTopicPage(page: page)
+                return Snapshot(topics: result.topics, page: page, sources: [], hasMore: result.hasMore)
+            }
+            var merged: [V2Topic] = []
+            var remaining: [String] = []
+            // A failed source fails the page, preserving the cursor for a complete retry.
+            for node in nodes {
+                let result = try await V2EXClient.shared.publicTopicPage(node: node, page: page)
+                merged += result.topics
+                if result.hasMore { remaining.append(node) }
+            }
+            var seen = Set<Int>()
+            merged = merged.filter { seen.insert($0.id).inserted }
+            if feed == .following { merged.sort { ($0.lastTouched ?? 0) > ($1.lastTouched ?? 0) } }
+            return Snapshot(topics: merged, page: page, sources: remaining, hasMore: !remaining.isEmpty)
         }
     }
 
@@ -87,24 +139,7 @@ final class HomeViewModel: ObservableObject {
         return promotionSignals.contains { haystack.contains($0) }
     }
 
-    private func followingFeed(nodes: [String]) async throws -> [V2Topic] {
-        guard !nodes.isEmpty else { return try await V2EXClient.shared.latestTopics() }
 
-        var merged: [V2Topic] = []
-        // Sequential rather than parallel: v1 has a shared 600/hour IP budget and
-        // hammering it from a cold launch is the fastest way to get throttled.
-        for name in nodes.prefix(6) {
-            if let batch = try? await V2EXClient.shared.topics(inNode: name) {
-                merged.append(contentsOf: batch)
-            }
-        }
-        if merged.isEmpty { return try await V2EXClient.shared.latestTopics() }
-
-        var seen = Set<Int>()
-        return merged
-            .filter { seen.insert($0.id).inserted }
-            .sorted { ($0.lastTouched ?? 0) > ($1.lastTouched ?? 0) }
-    }
 }
 
 struct HomeView: View {
@@ -295,6 +330,19 @@ struct HomeView: View {
                         }
                         .buttonStyle(.row)
                         .promotionBadge(for: topic)
+                    }
+                }
+                if model.feed == feed {
+                    if let error = model.moreError {
+                        Text(error).font(.footnote).foregroundStyle(Theme.muted)
+                        Button("重试加载更多") { Task { await model.loadMore(feed: feed) } }
+                    } else if model.hasMore {
+                        ProgressView()
+                            .padding()
+                            .task(id: model.paginationID) { await model.loadMore(feed: feed) }
+                    } else if !model.topics.isEmpty {
+                        Text(feed == .hot || feed == .r2 ? "已展示全部榜单话题" : "没有更多话题了")
+                            .font(.footnote).foregroundStyle(Theme.muted).padding()
                     }
                 }
             }

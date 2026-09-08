@@ -117,6 +117,33 @@ actor V2EXClient {
         try await getV1("/api/topics/latest.json")
     }
 
+    struct TopicPage {
+        let topics: [V2Topic]
+        let hasMore: Bool
+    }
+
+    /// Public website pagination also works without an API token.
+    func publicTopicPage(node: String? = nil, page: Int) async throws -> TopicPage {
+        if let node, node.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) == nil {
+            throw V2EXError.decoding("节点名称无效")
+        }
+        let path = node.map { "/go/\($0)" } ?? "/recent"
+        let html = try await webHTML(path: "\(path)?p=\(page)", userAgent: Self.desktopUserAgent)
+        let topics = Self.topicRows(from: html).map { topic in
+            var topic = topic
+            if topic.node == nil, let node { topic.node = V2Node.stub(name: node) }
+            return topic
+        }
+        // A challenge/login/error page must not silently become the end of a feed.
+        guard !topics.isEmpty else { throw V2EXError.decoding("网页没有返回话题，请稍后重试") }
+        let links = Self.matches(in: html, pattern: #"href="([^"\s]+)""#, groupCount: 1)
+        let hasMore = links.contains { link in
+            guard let url = URLComponents(string: HTMLText.plain(link[1])), url.path == path else { return false }
+            return url.queryItems?.contains { $0.name == "p" && (Int($0.value ?? "") ?? 0) > page } == true
+        }
+        return TopicPage(topics: topics, hasMore: hasMore)
+    }
+
     /// `/api/topics/hot.json` 的服务端返回上限。
     private static let hotAPILimit = 10
 
@@ -166,7 +193,11 @@ actor V2EXClient {
         var topics: [V2Topic] = []
         var seen = Set<Int>()
 
-        for block in html.components(separatedBy: #"<div class="cell item""#).dropFirst() {
+        let normalized = html.replacingOccurrences(
+            of: #"<div class="cell from_\d+ t_\d+""#,
+            with: #"<div class="cell item""#, options: .regularExpression
+        )
+        for block in normalized.components(separatedBy: #"<div class="cell item""#).dropFirst() {
             guard let title = matches(
                 in: block,
                 pattern: #"<a(?=[^>]*\bhref="/t/(\d+)(?:#[^"]*)?")(?=[^>]*\bclass="[^"]*\btopic-link\b[^"]*")[^>]*>([\s\S]*?)</a>"#,
@@ -200,6 +231,7 @@ actor V2EXClient {
                 node: node.map { V2Node.stub(name: $0[1], title: HTMLText.plain($0[2])) },
                 member: author.map {
                     var member = V2Member(username: $0)
+                    member.id = htmlField(block, pattern: #"data-uid="(\d+)""#).flatMap(Int.init)
                     member.avatarLarge = upscaledAvatar(avatar)
                     member.avatarNormal = avatar
                     return member
